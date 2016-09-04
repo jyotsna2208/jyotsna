@@ -1,0 +1,20 @@
+{
+  "name": "tar-bench",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "for f in *.js; do node $f; done;"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "archiver": "^1.0.0",
+    "pako" : "*",
+    "node-archiver": "^0.2.0",
+    "node-zopfli": "^1.4.0",
+    "tar-fs": "^1.13.0",
+    "tar-pack": "^3.1.3"
+  }
+}

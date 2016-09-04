@@ -1,0 +1,15 @@
+{
+  "tags": {
+    "allowUnknownTags": true
+  },
+  "source": {
+  },
+  "plugins": [],
+  "templates": {
+    "cleverLinks": false,
+    "monospaceLinks": false,
+    "systemName" : "Gridcontrol",
+    "copyright" : "Alexandre Strzelewicz",
+    "theme" : "simplex"
+  }
+}

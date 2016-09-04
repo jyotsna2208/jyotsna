@@ -1,0 +1,10 @@
+node_modules
+research/hyperdrive/todest/
+npm-debug.log
+*.tar.gz
+apidocs
+test/sync.tar.gz
+*.tgz
+*.zip
+*.tar
+Gridfile

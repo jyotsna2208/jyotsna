@@ -1,0 +1,493 @@
+#!/usr/bin/env node
+
+const program      = require('commander');
+const fs           = require('fs');
+const path         = require('path');
+const package      = require('../package.json');
+const sshexec      = require('ssh-exec');
+const chalk        = require('chalk');
+const cliSpinners  = require('cli-spinners');
+const async        = require('async');
+const grid         = require('grid-api');
+const cliux        = require('../lib/cli-ux.js');
+const multissh     = require('multissh');
+const shelljs      = require('shelljs');
+const Common       = require('../lib/common.js');
+const SSH          = require('../lib/workflows/ssh.js');
+const Dashboard    = require('../lib/dashboard.js');
+
+program
+  .version(package.version);
+
+program
+  .command('new')
+  .alias('generate')
+  .option('--force', 'Force overriding current Gridfile')
+  .description('Generate a Gridfile')
+  .action(function(opts) {
+
+    function generate() {
+      Common.generateGridfileSSH(process.cwd())
+        .then((data) => {
+          console.log(chalk.bold.green('✓ Gridfile generated successfully in current path (%s)'), data.file);
+          exitSuccess(false);
+        })
+        .catch((err) => {
+          exitError(err);
+        });
+    }
+
+    if (opts.force == true)
+      return generate()
+
+    try {
+      fs.statSync(path.join(process.cwd(), 'Gridfile'));
+    } catch(e) {
+      return generate()
+    }
+
+    console.error(chalk.bold.red('X Gridfile already exists in current folder'));
+    console.info(chalk.yellow.bold('Delete Gridfile or use --force option'));
+  });
+
+program
+  .command('provision')
+  .description('Provision each host declared in Gridfile')
+  .action(function(gridfile) {
+    var conf_path = path.join(process.cwd(), 'Gridfile');
+
+    var conf;
+
+    Common.parseGridfile(conf_path)
+      .then((_conf) => {
+        conf = _conf;
+        return Promise.resolve();
+      })
+      .then(() => {
+        return new Promise((resolve, reject) => {
+          var cmd = 'ssh-add ' + conf.ssh_key;
+          console.log(cmd);
+          shelljs.exec(cmd, () => {
+            return resolve();
+          });
+        });
+      })
+      .then(() => {
+        return SSH.copy_public_key(conf, conf.ssh_public_key)
+      })
+      .then(() => {
+
+        // Copy install script locally
+        shelljs.cp(path.join(__dirname, '../lib/install.sh'), '/tmp/');
+        console.log(chalk.bold.green('✓ Install script copied successfully locally'));
+
+        async.forEachLimit(conf.servers, 5, (server, next) => {
+          SSH.copy_install_script(server, conf)
+            .then(function() {
+              next();
+            })
+            .catch(e => {
+              console.error(e.message || e);
+              next();
+            })
+        }, (err) => {
+          var cmd;
+
+          if (conf.grid_password)
+            cmd = "cat /tmp/install.sh | GRID=" + conf.grid_name + " GRID_AUTH=" + conf.grid_password + " bash"
+          else
+            cmd = "cat /tmp/install.sh | GRID=" + conf.grid_name + " bash"
+
+          execCmd({
+            cmd         : cmd,
+            server_list : conf.servers,
+            title       : 'Provisioning Grid'
+          });
+        });
+      })
+      .catch((e) => {
+        exitError(e);
+      });
+  });
+
+program
+  .command('sample <project-name>')
+  .description('Generate sample project')
+  .action(function(project_name) {
+    var sample_project = path.join(__dirname, '../lib/template/sample-project');
+    var destination_folder = path.join(process.cwd(), project_name);
+    shelljs.cp('-R', sample_project, destination_folder);
+  });
+
+program
+  .command('multissh <bash_command>')
+  .description('Execute a bash command on each Grid nodes')
+  .action(function(bash_command) {
+    var conf_path = path.join(process.cwd(), 'Gridfile');
+
+    Common.parseGridfile(conf_path)
+      .then((conf) => {
+        execCmd({
+          cmd         : bash_command,
+          server_list : conf.servers,
+          ssh_key     : conf.ssh_key,
+          title : 'Executing command: ' + bash_command
+        });
+      })
+      .catch((e) => {
+        exitError(e);
+      });
+  });
+
+program
+  .command('restart')
+  .alias('update')
+  .option('--local')
+  .description('Restore the Grid based on current Gridfile')
+  .action(function(opts) {
+    var conf_path = path.join(process.cwd(), 'Gridfile');
+
+    Common.parseGridfile(conf_path)
+      .then((gridfile) => {
+        var servers = gridfile.servers;
+        var grid_name = gridfile.grid_name;
+
+        console.log(chalk.bold('☢ Launching recovery for %s hosts'), servers.length);
+        console.log(chalk.bold('☢ Forcing grid name %s'), grid_name);
+
+
+        var cmd = 'pm2 kill ; pm2 ls; GRID="' + grid_name + '"';
+
+        if (gridfile.grid_password)
+          cmd += ' GRID_AUTH="' + gridfile.grid_password + '"';
+
+        cmd += ' pm2 restart gridcontrol';
+
+        if (opts.local === true)
+          servers = [];
+
+        execCmd({
+          cmd         : cmd,
+          server_list : servers,
+          ssh_key     : gridfile.ssh_key,
+          title       : 'Recovering Grid: ' + grid_name
+        });
+      })
+
+  });
+
+program
+  .command('list')
+  .alias('ls')
+  .option('--watch')
+  .option('--raw')
+  .description('List all peers connected to network')
+  .action(function(opts) {
+    if (opts.watch === true)
+      cliux.displayHostsWatch();
+    else if (opts.raw === true) {
+      grid.listHosts(function(err, hosts) {
+        if (err) return exitError(err);
+        console.log(JSON.stringify(hosts, '', 2));
+      });
+    }
+    else
+      Common.displayHosts();
+  });
+
+program
+  .command('dash')
+  .description('Display Dashboard')
+  .action(function() {
+    Dashboard.init();
+  });
+
+program
+  .command('upgrade')
+  .description('Upgrade whole grid to latest gridcontrol version')
+  .action(function() {
+    var conf_path = path.join(process.cwd(), 'Gridfile');
+
+    Common.parseGridfile(conf_path)
+      .then((conf) => {
+        var cmd;
+
+        if (conf.grid_password)
+          cmd = "GRID=" + conf.grid_name + " GRID_AUTH=" + conf.grid_password + " pm2 install gridcontrol"
+        else
+          cmd = "GRID=" + conf.grid_name + " pm2 install gridcontrol"
+
+        execCmd({
+          cmd         : cmd,
+          server_list : conf.servers,
+          ssh_key     : conf.ssh_key,
+          title       : 'Upgrading Gridcontrol to latest'
+        });
+      })
+    });
+
+/**
+ * These following commands uses directly SSH
+ */
+program
+  .command('conf:keycopy [custom_ssh_key]')
+  .description('Install public key on remote hosts (default to $HOME/.ssh/id_rsa.pub)')
+  .action(function(custom_key) {
+    var conf_path = path.join(process.cwd(), 'Gridfile');
+
+    Common.parseGridfile(conf_path)
+      .then((conf) => {
+        return SSH.copy_public_key(conf, conf.ssh_public_key)
+      })
+      .then(() => {
+        exitSuccess();
+      })
+      .catch(e => {
+        exitError(e);
+      })
+  });
+
+program
+  .command('ssh')
+  .description('Interactively choose Node to connect via SSH')
+  .action(function(hostname) {
+    var conf_path = path.join(process.cwd(), 'Gridfile');
+
+    function act(meta) {
+      const spawn = require('child_process').spawn;
+
+      var con = meta.user + '@' + meta.ip;
+
+      console.log('Executing command: ssh %s', con);
+      spawn('ssh', [con], {
+        stdio : 'inherit'
+      });
+    }
+
+    Common.parseGridfile(conf_path)
+      .then((conf) => {
+        cliux.chooseHostname(conf.servers, act);
+      })
+      .catch((err) => {
+        exitError(err);
+      });
+  });
+
+program
+  .command('keygen <key_name>')
+  .option('--no-chmod')
+  .description('Generate SSH keypairs')
+  .action(function(name, opts) {
+    console.log(chalk.bold('Generating, it can take some time (~10secs)'));
+
+    SSH.generate_keypair({ bits : 1024 })
+      .then((keypair) => {
+        console.log(chalk.bold('Done.\n'));
+
+        var public_key = name + '.pub';
+
+        fs.writeFileSync(public_key, keypair.public);
+        fs.writeFileSync(name, keypair.private);
+
+        if (opts.chmod) {
+          fs.chmodSync(public_key, '400');
+          fs.chmodSync(name, '400');
+        }
+
+        console.log('Generated Public key:');
+        console.log(chalk.bold('./' + public_key));
+        console.log('Generated Private key:');
+        console.log(chalk.bold('./' + name));
+        console.log('Copy to target hosts:');
+        console.log(chalk.bold('$ grid keycopy [gridfile] ' + public_key));
+        exitSuccess();
+      })
+      .catch(e => {
+        exitError(e);
+      });
+  });
+
+
+
+// program
+//   .command('provision <username> <ip> <grid_name>')
+//   .option('--ssh_key <public_ssh_key>')
+//   .option('--grid_password <grid password>')
+//   .description('provision a remote node')
+//   .action(function(user, ip, grid_name, opts) {
+//     SSH.provision_target({
+//       user: user,
+//       ip : ip
+//     }, {
+//       grid_name : grid_name,
+//       ssh_key : opts ? opts.key : null
+//     }).then(function() {
+//       Common.displayHosts(function() {
+//         exitSuccess('✓ Remote node successfully provisioned');
+//       });
+//     })
+//       .catch(e => {
+//         exitError(e);
+//       })
+//   });
+
+program
+  .command('unprovision')
+  .description('Uninstall grid control on all nodes')
+  .action(function() {
+    var conf_path = path.join(process.cwd(), 'Gridfile');
+
+    Common.parseGridfile(conf_path)
+      .then((conf) => {
+        execCmd({
+          cmd : 'pm2 uninstall gridcontrol',
+          server_list : conf.servers,
+          ssh_key     : conf.ssh_key,
+          title : 'Unprovisioning Gridcontrol'
+        })
+      })
+      .catch(e => {
+        exitError(e);
+      });
+  });
+
+program
+  .command('detect')
+  .description('Use nmap to discover machines in network')
+  .action(function(opts) {
+    var exec = shelljs.exec('sudo nmap -sP 192.168.0.1/24', function() {
+      Common.displayHosts();
+    });
+  });
+
+program
+  .command('conf:update')
+  .description('Update Gridfile with current hosts')
+  .action(function(opts) {
+    var gridfile = path.join(process.cwd(), 'Gridfile');
+    Common.updateGridfile(gridfile)
+      .then((data) => {
+        console.log(chalk.bold('Gridfile updated (%s)'), data.file);
+        console.log();
+        console.log(chalk.bold('Gridfile content:\n'));
+        var file = fs.readFileSync(data.file);
+        console.log(file.toString());
+      })
+      .catch((err) => {
+        exitError(err);
+      });
+  });
+
+program
+  .command('logs [task_name]')
+  .alias('log')
+  .description('Display logs of all nodes')
+  .action(function(task_name) {
+    var conf_path = path.join(process.cwd(), 'Gridfile');
+
+    Common.parseGridfile(conf_path)
+      .then((conf) => {
+        var cmd = 'pm2 logs' + (task_name ? ' ' + task_name : '') + ' --lines 20';
+
+        execCmd({
+          cmd         : cmd,
+          server_list : conf.servers,
+          ssh_key     : conf.ssh_key,
+          title       : 'Logs'
+        });
+      })
+      .catch((e) => {
+        exitError(e);
+      });
+  });
+
+program
+  .command('monitor <secret> <public>')
+  .description('Monitor all Grid Nodes with Keymetrics')
+  .action(function(secret, public) {
+    var conf_path = path.join(process.cwd(), 'Gridfile');
+
+    Common.parseGridfile(conf_path)
+      .then((conf) => {
+        var cmd = 'pm2 link ' + secret + ' ' + public;
+
+        execCmd({
+          cmd         : cmd,
+          server_list : conf.servers,
+          ssh_key     : conf.ssh_key,
+          title       : 'Linking to Keymetrics'
+        });
+      })
+      .catch((e) => {
+        exitError(e);
+      });
+  });
+
+/**
+ * Generics
+ */
+program
+  .command('*')
+  .action(function(env){
+    console.log('Enter a Valid command');
+    program.outputHelp();
+    process.exit(0);
+  });
+
+program.parse(process.argv);
+
+if (!process.argv.slice(2).length) {
+  program.outputHelp();
+}
+
+/**
+ * @param {Object}   opts
+ * @param {String}   opts.cmd command to execute
+ * @param {Object[]} opts.server_list Server list (ip, user, local)
+ * @param {String}   [opts.title="MultiSSH] Optional window title
+ */
+function execCmd(opts) {
+  /**
+   * Always append local server
+   */
+  opts.server_list.push({
+    ip : '127.0.0.1',
+    user : process.env.USER,
+    local : true
+  });
+
+  multissh.start(opts, function() {
+    Common.displayHosts(function() {
+      exitSuccess()
+    });
+  });
+};
+
+function listServerForMulti(cb) {
+  grid.listHosts(function(err, hosts) {
+    if (err) return cb(err);
+    var server_list = [];
+
+    hosts.forEach(function(host) {
+      server_list.push({
+        ip : host.public_ip,
+        user : host.user,
+        local : host.local
+      });
+    });
+
+    return cb(null, server_list);
+  });
+}
+
+function exitError(err) {
+  console.trace(err);
+  process.exit(1);
+}
+
+function exitSuccess(msg) {
+  if (msg === false) return process.exit(0);
+  console.log('');
+  console.log(chalk.bold.green(msg || '✓ Action successfully executed'));
+  process.exit(0);
+}
